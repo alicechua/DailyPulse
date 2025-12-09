@@ -1,0 +1,5 @@
+{
+  "name": "Daily Pulse Assistant",
+  "description": "A personalized AI news assistant that generates a daily briefing with audio, powered by Gemini Search Grounding and Text-to-Speech.",
+  "requestFramePermissions": []
+}

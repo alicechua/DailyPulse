@@ -1,0 +1,36 @@
+
+name: Daily Pulse Briefing
+
+on:
+  schedule:
+    # Runs at 08:00 UTC every day. 
+    # Adjust this cron expression to your local timezone.
+    # e.g., for 8am EST (UTC-5), use '0 13 * * *'
+    - cron: '0 8 * * *'
+  
+  # Allows you to run this workflow manually from the Actions tab for testing
+  workflow_dispatch:
+
+jobs:
+  briefing:
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v3
+
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '20'
+        cache: 'npm'
+
+    - name: Install Dependencies
+      run: npm install
+
+    - name: Run Daily Briefing
+      env:
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+        TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      run: npm run briefing

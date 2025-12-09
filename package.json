@@ -1,0 +1,15 @@
+{
+  "name": "daily-pulse-assistant",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Headless Daily Pulse Assistant for GitHub Actions",
+  "scripts": {
+    "briefing": "node scripts/daily-briefing.mjs"
+  },
+  "dependencies": {
+    "@google/genai": "^1.0.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}

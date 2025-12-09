@@ -1,4 +1,3 @@
-
 name: Daily Pulse Briefing
 
 on:
@@ -23,7 +22,7 @@ jobs:
       uses: actions/setup-node@v3
       with:
         node-version: '20'
-        cache: 'npm'
+        # Removed 'cache: npm' line to allow running without package-lock.json
 
     - name: Install Dependencies
       run: npm install

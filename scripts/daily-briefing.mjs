@@ -15,10 +15,12 @@ const GOOGLE_NEWS_BASE = "https://news.google.com/rss/search?q=";
 const FEEDS = {
   "reuters_world": `${GOOGLE_NEWS_BASE}site:reuters.com+world&hl=en-US&gl=US&ceid=US:en`,
   "reuters_ai": `${GOOGLE_NEWS_BASE}site:reuters.com+artificial+intelligence+OR+AI&hl=en-US&gl=US&ceid=US:en`,
+  "reuters_tech": `${GOOGLE_NEWS_BASE}site:reuters.com+technology&hl=en-US&gl=US&ceid=US:en`,
   "bbc_news": "https://feeds.bbci.co.uk/news/rss.xml",
   "al_jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
   "guardian_world": "https://www.theguardian.com/world/rss",
   "ft_home": "https://www.ft.com/rss/home",
+  "the_verge": "https://www.theverge.com/rss/index.xml",
   "openai_news": "https://openai.com/news/rss.xml",
   "deepmind": "https://deepmind.google/blog/feed/basic",
   "arxiv_ai": "https://export.arxiv.org/rss/cs.AI",
@@ -31,8 +33,11 @@ const SOURCE_WEIGHT = {
   "openai_news": 0.95,
   "arxiv_ai": 0.9,
   "guardian_world": 0.9,
+  "the_verge": 0.9,
   "reuters_world": 0.85,
   "reuters_ai": 0.85,
+  "reuters_tech": 0.85,
+  "al_jazeera": 0.85,
 };
 
 // ------------------------------------------------------------------
@@ -95,8 +100,15 @@ function calculateRank(item) {
   // Topic Bonus
   let topicBonus = 0;
   const t = item.title.toLowerCase();
-  if (t.includes('ai') || t.includes('gpt') || t.includes('intelligence')) topicBonus = 0.05;
+  
+  // AI Keywords
+  if (t.includes('ai') || t.includes('gpt') || t.includes('intelligence') || t.includes('llm')) topicBonus = 0.05;
+  
+  // Business Keywords
   if (t.includes('market') || t.includes('economy')) topicBonus = 0.03;
+  
+  // Tech Keywords
+  if (t.includes('tech') || t.includes('apple') || t.includes('google') || t.includes('microsoft') || t.includes('startup') || t.includes('software')) topicBonus = 0.04;
 
   return weight + recency + topicBonus;
 }
@@ -174,9 +186,12 @@ async function main() {
   // Simple Deduplication by normalized title
   const seen = new Set();
   const curated = [];
+  // Slightly increased limit to accommodate 3 topics
+  const MAX_STORIES = 18; 
+  
   for (const item of ranked) {
     const norm = item.title.toLowerCase().replace(/[^a-z0-9]/g, '');
-    if (!seen.has(norm) && curated.length < 15) { // Top 15 stories
+    if (!seen.has(norm) && curated.length < MAX_STORIES) {
       seen.add(norm);
       curated.push(item);
     }
@@ -187,15 +202,19 @@ async function main() {
   // 3. Generate Briefing Text
   console.log("✍️ Generating Briefing Text...");
   const prompt = `
-    You are a personal news anchor.
-    Here are the top headlines for today:
+    You are a professional personal news anchor.
+    Here are the top headlines for today from trusted sources:
     ${context}
 
     Write a concise, engaging morning briefing script.
-    Cover the most important world news and AI updates.
+    You MUST cover these three areas clearly:
+    1. Major World News
+    2. Artificial Intelligence Updates
+    3. Technology Trends
+
     Do not read out URLs.
-    Keep it under 3 minutes of speaking time.
-    Start with "Good Morning, here is your daily briefing."
+    Keep it under 3 minutes of speaking time (approx 400-500 words).
+    Start with "Good Morning, here is your daily briefing covering World events, AI, and Tech."
   `;
 
   const textResp = await ai.models.generateContent({
@@ -234,7 +253,7 @@ async function main() {
   
   const formData = new FormData();
   formData.append('chat_id', chatId);
-  formData.append('caption', `Daily Briefing - ${new Date().toLocaleDateString()}`);
+  formData.append('caption', `Daily Briefing (World, AI, Tech) - ${new Date().toLocaleDateString()}`);
   formData.append('title', `Daily Briefing`);
   formData.append('performer', 'Gemini AI');
   

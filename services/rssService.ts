@@ -1,3 +1,4 @@
+
 import { FeedItem, CuratedFeeds } from '../types';
 
 // -------------------------
@@ -34,8 +35,9 @@ const FEEDS: Record<string, string> = {
   
   // arXiv feeds (direct export URLs)
   "arXiv cs.AI": "https://export.arxiv.org/rss/cs.AI",
-  "arXiv cs.LG": "https://export.arxiv.org/rss/cs.LG",
-  "arXiv cs.CL": "https://export.arxiv.org/rss/cs.CL",
+  "arXiv cs.LG": "https://export.arxiv.org/rss/cs.LG", // Machine Learning
+  "arXiv cs.CV": "https://export.arxiv.org/rss/cs.CV", // Computer Vision
+  "arXiv cs.CL": "https://export.arxiv.org/rss/cs.CL", // Comp & Language
 };
 
 const SOURCE_WEIGHT: Record<string, number> = {
@@ -54,15 +56,16 @@ const SOURCE_WEIGHT: Record<string, number> = {
   "Financial Times Home": 0.95,
   "DeepMind Blog": 0.95,
   "OpenAI News": 0.95,
-  "arXiv cs.AI": 0.85,
-  "arXiv cs.LG": 0.85,
-  "arXiv cs.CL": 0.85,
+  "arXiv cs.AI": 0.90, // Boosted slightly
+  "arXiv cs.LG": 0.90,
+  "arXiv cs.CV": 0.90,
+  "arXiv cs.CL": 0.90,
 };
 
 const AI_KEYWORDS = new Set([
   "ai", "artificial intelligence", "machine learning", "deep learning",
   "llm", "language model", "openai", "deepmind", "anthropic", "meta ai",
-  "vision transformer", "transformer", "arxiv", "gpt"
+  "vision transformer", "transformer", "arxiv", "gpt", "diffusion model"
 ]);
 
 const BUSINESS_KEYWORDS = new Set([
@@ -99,8 +102,12 @@ function parseFeedXML(sourceName: string, xmlText: string): FeedItem[] {
     const title = node.querySelector("title")?.textContent || "";
     const link = node.querySelector("link")?.textContent || "";
     const pubDate = node.querySelector("pubDate")?.textContent;
+    const description = node.querySelector("description")?.textContent || "";
+    
     if (title && link) {
-      items.push({ source: sourceName, title, link, published: pubDate || undefined });
+      // Clean description slightly
+      const cleanDesc = description.replace(/<[^>]+>/g, '').trim().substring(0, 500); 
+      items.push({ source: sourceName, title, link, published: pubDate || undefined, description: cleanDesc });
     }
   });
 
@@ -112,8 +119,11 @@ function parseFeedXML(sourceName: string, xmlText: string): FeedItem[] {
       const linkNode = node.querySelector("link");
       const link = linkNode?.getAttribute("href") || "";
       const updated = node.querySelector("updated")?.textContent;
+      const summary = node.querySelector("summary")?.textContent || node.querySelector("content")?.textContent || "";
+
       if (title && link) {
-        items.push({ source: sourceName, title, link, published: updated || undefined });
+        const cleanDesc = summary.replace(/<[^>]+>/g, '').trim().substring(0, 500);
+        items.push({ source: sourceName, title, link, published: updated || undefined, description: cleanDesc });
       }
     });
   }

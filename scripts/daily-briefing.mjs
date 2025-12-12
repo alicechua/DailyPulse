@@ -23,7 +23,11 @@ const FEEDS = {
   "the_verge": "https://www.theverge.com/rss/index.xml",
   "openai_news": "https://openai.com/news/rss.xml",
   "deepmind": "https://deepmind.google/blog/feed/basic",
+  // Expanded arXiv feeds
   "arxiv_ai": "https://export.arxiv.org/rss/cs.AI",
+  "arxiv_lg": "https://export.arxiv.org/rss/cs.LG", // Machine Learning
+  "arxiv_cv": "https://export.arxiv.org/rss/cs.CV", // Computer Vision
+  "arxiv_cl": "https://export.arxiv.org/rss/cs.CL", // Computation and Language
 };
 
 const SOURCE_WEIGHT = {
@@ -32,6 +36,9 @@ const SOURCE_WEIGHT = {
   "deepmind": 0.95,
   "openai_news": 0.95,
   "arxiv_ai": 0.9,
+  "arxiv_lg": 0.9,
+  "arxiv_cv": 0.9,
+  "arxiv_cl": 0.9,
   "guardian_world": 0.9,
   "the_verge": 0.9,
   "reuters_world": 0.85,
@@ -43,6 +50,30 @@ const SOURCE_WEIGHT = {
 // ------------------------------------------------------------------
 // HELPERS
 // ------------------------------------------------------------------
+
+/**
+ * Retries an async operation with exponential backoff
+ */
+async function retryWithBackoff(operation, maxRetries = 5, initialDelay = 5000) {
+  let delay = initialDelay;
+  for (let i = 1; i <= maxRetries; i++) {
+    try {
+      return await operation();
+    } catch (error) {
+      // Check for 503 Overloaded or 429 Too Many Requests or generic "overloaded" message
+      const statusCode = error.status || error?.response?.status;
+      const isTransient = statusCode === 503 || statusCode === 429 || (error.message && error.message.toLowerCase().includes('overloaded'));
+      
+      if (isTransient && i < maxRetries) {
+        console.warn(`⚠️  Model overloaded/busy (${statusCode}). Retrying in ${delay/1000}s... (Attempt ${i}/${maxRetries})`);
+        await new Promise(resolve => setTimeout(resolve, delay));
+        delay *= 2; // Exponential backoff (5s, 10s, 20s, 40s...)
+      } else {
+        throw error;
+      }
+    }
+  }
+}
 
 /**
  * Simple Regex-based XML Parser for RSS (Node.js doesn't have DOMParser)
@@ -75,8 +106,13 @@ function parseRSS(sourceName, xml) {
     const dateMatch = content.match(/<(pubDate|updated)>(.*?)<\/\1>/i);
     const published = dateMatch ? dateMatch[2] : undefined;
 
+    // Extract Description / Abstract
+    const descMatch = content.match(/<(description|summary)>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/\1>/i);
+    // Remove HTML tags and truncate for context size
+    const description = descMatch ? descMatch[2].replace(/<[^>]+>/g, '').trim().substring(0, 500) : "";
+
     if (title && link) {
-      items.push({ source: sourceName, title, link, published });
+      items.push({ source: sourceName, title, link, published, description });
     }
   }
   return items;
@@ -102,7 +138,7 @@ function calculateRank(item) {
   const t = item.title.toLowerCase();
   
   // AI Keywords
-  if (t.includes('ai') || t.includes('gpt') || t.includes('intelligence') || t.includes('llm')) topicBonus = 0.05;
+  if (t.includes('ai') || t.includes('gpt') || t.includes('intelligence') || t.includes('llm') || t.includes('diffusion')) topicBonus = 0.05;
   
   // Business Keywords
   if (t.includes('market') || t.includes('economy')) topicBonus = 0.03;
@@ -186,8 +222,8 @@ async function main() {
   // Simple Deduplication by normalized title
   const seen = new Set();
   const curated = [];
-  // Slightly increased limit to accommodate 3 topics
-  const MAX_STORIES = 18; 
+  // Slightly increased limit to accommodate more research papers
+  const MAX_STORIES = 20; 
   
   for (const item of ranked) {
     const norm = item.title.toLowerCase().replace(/[^a-z0-9]/g, '');
@@ -197,40 +233,57 @@ async function main() {
     }
   }
 
-  const context = curated.map(i => `- [${i.source}] ${i.title}`).join("\n");
+  // Build Context with Abstracts for arXiv papers
+  const context = curated.map(i => {
+    let entry = `- [${i.source}] ${i.title}`;
+    if (i.source.includes('arxiv') && i.description) {
+      entry += `\n  Abstract: ${i.description}`;
+    }
+    return entry;
+  }).join("\n");
   
   // 3. Generate Briefing Text
   console.log("✍️ Generating Briefing Text...");
+  
+  const dateStr = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+  
   const prompt = `
     You are a professional personal news anchor.
+    It is currently ${dateStr}.
+
     Here are the top headlines for today from trusted sources:
     ${context}
 
     Write a concise, engaging morning briefing script.
-    You MUST cover these three areas clearly:
+    You MUST cover these areas:
     1. Major World News
-    2. Artificial Intelligence Updates
+    2. Artificial Intelligence & Machine Learning Research
     3. Technology Trends
 
-    Do not read out URLs.
-    Keep it under 3 minutes of speaking time (approx 400-500 words).
-    Start with "Good Morning, here is your daily briefing covering World events, AI, and Tech."
+    Specific Instructions:
+    - **Start** with "Good Morning, today is ${dateStr}. Here is your daily briefing..."
+    - For any research papers (like arXiv) mentioned, you **must** provide a one-sentence summary of the main contribution/idea based on the abstract provided.
+    - Do not read out URLs.
+    - Keep it under 3 minutes of speaking time (approx 400-500 words).
   `;
 
-  const textResp = await ai.models.generateContent({
+  // Wrap API call in retry logic
+  const textResp = await retryWithBackoff(() => ai.models.generateContent({
     model: "gemini-2.5-flash",
     contents: prompt,
     // Note: We use the RSS feeds as primary context, but we enable Search 
     // to fill in details if the headlines are vague.
     config: { tools: [{ googleSearch: {} }] } 
-  });
+  }));
   
   const briefingText = textResp.text;
   console.log("   Briefing Length:", briefingText.length);
 
   // 4. Generate Audio (TTS)
   console.log("🗣️  Synthesizing Audio...");
-  const audioResp = await ai.models.generateContent({
+  
+  // Wrap API call in retry logic
+  const audioResp = await retryWithBackoff(() => ai.models.generateContent({
     model: "gemini-2.5-flash-preview-tts",
     contents: [{ parts: [{ text: briefingText }] }],
     config: {
@@ -239,7 +292,7 @@ async function main() {
         voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
       },
     },
-  });
+  }));
 
   const base64Audio = audioResp.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
   if (!base64Audio) throw new Error("No audio generated");
@@ -253,8 +306,8 @@ async function main() {
   
   const formData = new FormData();
   formData.append('chat_id', chatId);
-  formData.append('caption', `Daily Briefing (World, AI, Tech) - ${new Date().toLocaleDateString()}`);
-  formData.append('title', `Daily Briefing`);
+  formData.append('caption', `Daily Briefing (${dateStr})`);
+  formData.append('title', `Daily Briefing - ${dateStr}`);
   formData.append('performer', 'Gemini AI');
   
   // Blob is available in Node 18+

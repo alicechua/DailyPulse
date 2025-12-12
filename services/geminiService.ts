@@ -1,3 +1,4 @@
+
 import { GoogleGenAI, Modality } from "@google/genai";
 import { NewsSource, GroundingChunk, FeedItem } from "../types";
 import { fetchAndCurateFeed } from "./rssService";
@@ -40,7 +41,12 @@ export const generateNewsBriefing = async (
     if (relevantItems.length > 0) {
       feedContext = "Here are the top curated headlines from trusted sources:\n";
       relevantItems.forEach(item => {
-        feedContext += `- [${item.source}] ${item.title} (${item.published || 'Today'})\n`;
+        let entry = `- [${item.source}] ${item.title} (${item.published || 'Today'})\n`;
+        // Include summary for arXiv or scientific papers
+        if (item.source.toLowerCase().includes('arxiv') && item.description) {
+           entry += `  Abstract: ${item.description}\n`;
+        }
+        feedContext += entry;
         rssSources.push({ title: item.title, uri: item.link });
       });
       feedContext += "\nUse these headlines as the primary source of truth for the briefing. You may use Google Search to expand on them or find breaking news not listed here.";
@@ -53,19 +59,26 @@ export const generateNewsBriefing = async (
     feedContext = "Please rely on Google Search to find the latest news.";
   }
 
+  const dateStr = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
   const topicString = topics.join(", ");
+  
   const prompt = `
     You are a professional, articulate personal assistant. 
-    It is currently ${new Date().toLocaleDateString()}.
+    It is currently ${dateStr}.
     
     ${feedContext}
 
     Provide a comprehensive "Morning Briefing" covering the latest news and updates for the following topics: ${topicString}.
     
+    Start the briefing by stating the date clearly (e.g., "Good Morning, today is Tuesday, October 24th...").
+
     Structure the response clearly with Markdown headers. 
     Focus on factual, up-to-date information.
+    
+    For any scientific papers or arXiv research mentioned, provide a one-sentence summary of the core idea.
+
     Keep the tone conversational but informative, like a radio news anchor.
-    Do not include pre-ambles like "Here is your briefing", just start with the news.
+    Do not include pre-ambles like "Here is your briefing", just start with the greeting and news.
   `;
 
   try {

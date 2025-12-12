@@ -37,6 +37,7 @@ export interface FeedItem {
   source: string;
   title: string;
   link: string;
+  description?: string; // Abstract or summary
   published?: string; // ISO string or original string
   score?: number; // Calculated rank score
   topic?: string; // Guessed topic

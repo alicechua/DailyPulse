@@ -2,13 +2,25 @@ name: Daily Pulse Briefing
 
 on:
   schedule:
-    # Runs at 08:00 UTC every day. 
+    # Runs at 08:00 UTC every day.
     # Adjust this cron expression to your local timezone.
     # e.g., for 8am EST (UTC-5), use '0 13 * * *'
     - cron: '0 8 * * *'
-  
+
   # Allows you to run this workflow manually from the Actions tab for testing
   workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run: skip Telegram (outputs are uploaded as an artifact)'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write # commit data/trend-history.json back to the repo
+
+concurrency:
+  group: daily-briefing
+  cancel-in-progress: false
 
 jobs:
   briefing:
@@ -16,20 +28,55 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v3
+      uses: actions/checkout@v7
 
     - name: Setup Node.js
-      uses: actions/setup-node@v3
+      uses: actions/setup-node@v7
       with:
-        node-version: '20'
-        # Removed 'cache: npm' line to allow running without package-lock.json
+        node-version: '24'
+        cache: npm
 
     - name: Install Dependencies
-      run: npm install
+      run: npm ci
 
     - name: Run Daily Briefing
       env:
+        LLM_PROVIDER: ${{ vars.LLM_PROVIDER }} # gemini (default) or azure
         GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        AZURE_OPENAI_ENDPOINT: ${{ vars.AZURE_OPENAI_ENDPOINT }}
+        AZURE_OPENAI_API_KEY: ${{ secrets.AZURE_OPENAI_API_KEY }}
+        AZURE_SPEECH_KEY: ${{ secrets.AZURE_SPEECH_KEY }}
+        AZURE_SPEECH_REGION: ${{ vars.AZURE_SPEECH_REGION }}
         TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
         TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # higher GitHub search rate limit
+        DRY_RUN: ${{ inputs.dry_run }}
+        # Optional repository variables to swap models without code changes (empty = defaults)
+        GEMINI_TEXT_MODEL: ${{ vars.GEMINI_TEXT_MODEL }}
+        GEMINI_TTS_MODEL: ${{ vars.GEMINI_TTS_MODEL }}
+        GEMINI_TTS_VOICE: ${{ vars.GEMINI_TTS_VOICE }}
+        AZURE_OPENAI_DEPLOYMENT: ${{ vars.AZURE_OPENAI_DEPLOYMENT }}
+        AZURE_SPEECH_VOICE: ${{ vars.AZURE_SPEECH_VOICE }}
       run: npm run briefing
+
+    # Trend detection needs yesterday's data. Committing it daily also keeps the repo "active",
+    # so GitHub doesn't auto-disable this schedule after 60 days (which happened in Feb 2026).
+    - name: Save trend history
+      if: always()
+      run: |
+        [ -f data/trend-history.json ] || exit 0
+        git config user.name "github-actions[bot]"
+        git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+        git add data/trend-history.json
+        if git diff --cached --quiet; then echo "No history changes"; exit 0; fi
+        git commit -m "chore: update trend history [skip ci]"
+        git push || (git pull --rebase && git push)
+
+    - name: Upload briefing outputs
+      if: always()
+      uses: actions/upload-artifact@v7
+      with:
+        name: briefing-${{ github.run_id }}
+        path: out/
+        retention-days: 7
+        if-no-files-found: ignore

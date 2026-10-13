@@ -1,333 +1,259 @@
-
-import { GoogleGenAI } from "@google/genai";
-import fs from 'fs';
-import path from 'path';
-import { Buffer } from 'node:buffer';
+import fs from 'node:fs';
+import path from 'node:path';
 import process from 'node:process';
+import { fileURLToPath } from 'node:url';
+import { AI_PATTERN, prepareCandidates, selectSections, trendPool } from './lib/curate.mjs';
+import { createLLM, generateText, synthesizeSpeech } from './lib/llm.mjs';
+import { fetchAllSources, sourceLabel } from './lib/sources.mjs';
+import { buildDigest, sendAudio, sendMessage } from './lib/telegram.mjs';
+import { aggregateEntities, detectEmerging, extractEntities, loadHistory, recordDay, recordShown, saveHistory } from './lib/trends.mjs';
+import { compact, escapeHtml, isoDate, loadDotEnv, truncate } from './lib/util.mjs';
+
+// Usage: node scripts/daily-briefing.mjs [--dry-run] [--no-audio]
+//   --dry-run   Don't send to Telegram (also DRY_RUN=true). Outputs are always written to out/.
+//   --no-audio  Skip text-to-speech.
+
+const OUT_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '../out');
 
 // ------------------------------------------------------------------
-// CONFIGURATION
+// BRIEFING PROMPT
 // ------------------------------------------------------------------
 
-const GOOGLE_NEWS_BASE = "https://news.google.com/rss/search?q=";
+const CONTEXT_SECTIONS = [
+  ['models', 'TRENDING MODELS (Hugging Face)'],
+  ['repos', 'RISING REPOS (GitHub, created this week)'],
+  ['research', 'TOP PAPERS (Hugging Face Daily Papers, by community upvotes)'],
+  ['discussion', 'AI ON HACKER NEWS'],
+  ['ai_news', 'FROM AI LABS, NEWS SITES & NEWSLETTERS'],
+  ['tech', 'TECH & INDUSTRY'],
+];
 
-// Note: No CORS proxy needed for Node.js
-const FEEDS = {
-  "reuters_world": `${GOOGLE_NEWS_BASE}site:reuters.com+world&hl=en-US&gl=US&ceid=US:en`,
-  "reuters_ai": `${GOOGLE_NEWS_BASE}site:reuters.com+artificial+intelligence+OR+AI&hl=en-US&gl=US&ceid=US:en`,
-  "reuters_tech": `${GOOGLE_NEWS_BASE}site:reuters.com+technology&hl=en-US&gl=US&ceid=US:en`,
-  "bbc_news": "https://feeds.bbci.co.uk/news/rss.xml",
-  "al_jazeera": "https://www.aljazeera.com/xml/rss/all.xml",
-  "guardian_world": "https://www.theguardian.com/world/rss",
-  "ft_home": "https://www.ft.com/rss/home",
-  "the_verge": "https://www.theverge.com/rss/index.xml",
-  "openai_news": "https://openai.com/news/rss.xml",
-  "deepmind": "https://deepmind.google/blog/feed/basic",
-  // Expanded arXiv feeds
-  "arxiv_ai": "https://export.arxiv.org/rss/cs.AI",
-  "arxiv_lg": "https://export.arxiv.org/rss/cs.LG", // Machine Learning
-  "arxiv_cv": "https://export.arxiv.org/rss/cs.CV", // Computer Vision
-  "arxiv_cl": "https://export.arxiv.org/rss/cs.CL", // Computation and Language
-};
-
-const SOURCE_WEIGHT = {
-  "bbc_news": 1.0,
-  "ft_home": 0.95,
-  "deepmind": 0.95,
-  "openai_news": 0.95,
-  "arxiv_ai": 0.9,
-  "arxiv_lg": 0.9,
-  "arxiv_cv": 0.9,
-  "arxiv_cl": 0.9,
-  "guardian_world": 0.9,
-  "the_verge": 0.9,
-  "reuters_world": 0.85,
-  "reuters_ai": 0.85,
-  "reuters_tech": 0.85,
-  "al_jazeera": 0.85,
-};
-
-// ------------------------------------------------------------------
-// HELPERS
-// ------------------------------------------------------------------
-
-/**
- * Retries an async operation with exponential backoff
- */
-async function retryWithBackoff(operation, maxRetries = 5, initialDelay = 5000) {
-  let delay = initialDelay;
-  for (let i = 1; i <= maxRetries; i++) {
-    try {
-      return await operation();
-    } catch (error) {
-      // Check for 503 Overloaded or 429 Too Many Requests or generic "overloaded" message
-      const statusCode = error.status || error?.response?.status;
-      const isTransient = statusCode === 503 || statusCode === 429 || (error.message && error.message.toLowerCase().includes('overloaded'));
-      
-      if (isTransient && i < maxRetries) {
-        console.warn(`⚠️  Model overloaded/busy (${statusCode}). Retrying in ${delay/1000}s... (Attempt ${i}/${maxRetries})`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-        delay *= 2; // Exponential backoff (5s, 10s, 20s, 40s...)
-      } else {
-        throw error;
-      }
-    }
-  }
+function itemStats(item) {
+  const m = item.metrics ?? {};
+  return {
+    discussion: `${m.points} points, ${m.comments} comments`,
+    repos: `${compact(m.stars)} stars, +${compact(m.starsPerDay)}/day`,
+    models: `trending score ${m.trending}, ${compact(m.likes)} likes`,
+    research: `${m.upvotes} upvotes`,
+  }[item.category];
 }
 
-/**
- * Simple Regex-based XML Parser for RSS (Node.js doesn't have DOMParser)
- */
-function parseRSS(sourceName, xml) {
-  const items = [];
-  // Match <item> or <entry> blocks
-  const itemRegex = /<(item|entry)>([\s\S]*?)<\/\1>/g;
-  
-  let match;
-  while ((match = itemRegex.exec(xml)) !== null) {
-    const content = match[2];
-    
-    // Extract Title
-    const titleMatch = content.match(/<title.*?>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?<\/title>/i);
-    const title = titleMatch ? titleMatch[1].trim() : "Untitled";
-
-    // Extract Link
-    let link = "";
-    const linkMatch = content.match(/<link.*?href=["'](.*?)["'].*?>/i); // Atom style
-    const linkMatchRSS = content.match(/<link>(.*?)<\/link>/i); // RSS style
-    
-    if (linkMatchRSS) {
-      link = linkMatchRSS[1].trim();
-    } else if (linkMatch) {
-      link = linkMatch[1].trim();
-    }
-
-    // Extract Date
-    const dateMatch = content.match(/<(pubDate|updated)>(.*?)<\/\1>/i);
-    const published = dateMatch ? dateMatch[2] : undefined;
-
-    // Extract Description / Abstract
-    const descMatch = content.match(/<(description|summary)>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?<\/\1>/i);
-    // Remove HTML tags and truncate for context size
-    const description = descMatch ? descMatch[2].replace(/<[^>]+>/g, '').trim().substring(0, 500) : "";
-
-    if (title && link) {
-      items.push({ source: sourceName, title, link, published, description });
-    }
-  }
-  return items;
+function describeItem(item) {
+  const stats = itemStats(item);
+  const description = item.description ? `\n  ${truncate(item.description, item.category === 'research' ? 400 : 250)}` : '';
+  return `- [${sourceLabel(item.source)}] ${item.title}${stats ? ` (${stats})` : ''}${description}`;
 }
 
-function calculateRank(item) {
-  const weight = SOURCE_WEIGHT[item.source] || 0.75;
-  
-  // Recency Bonus
-  let recency = 0;
-  if (item.published) {
-    try {
-      const pubDate = new Date(item.published);
-      const hours = (new Date().getTime() - pubDate.getTime()) / (1000 * 60 * 60);
-      if (!isNaN(hours) && hours > 0) {
-        recency = 0.25 * Math.exp(-hours / 36);
-      }
-    } catch (e) {}
-  }
-  
-  // Topic Bonus
-  let topicBonus = 0;
-  const t = item.title.toLowerCase();
-  
-  // AI Keywords
-  if (t.includes('ai') || t.includes('gpt') || t.includes('intelligence') || t.includes('llm') || t.includes('diffusion')) topicBonus = 0.05;
-  
-  // Business Keywords
-  if (t.includes('market') || t.includes('economy')) topicBonus = 0.03;
-  
-  // Tech Keywords
-  if (t.includes('tech') || t.includes('apple') || t.includes('google') || t.includes('microsoft') || t.includes('startup') || t.includes('software')) topicBonus = 0.04;
-
-  return weight + recency + topicBonus;
+function describeEntity(entity, warmingUp) {
+  const status = warmingUp ? '' : entity.isNew ? `, new (first seen ${entity.firstSeen})` : ', spiking vs. its recent baseline';
+  const sources = [...entity.sources].map(sourceLabel).join(', ');
+  const refs = entity.items.slice(0, 4).map(item => {
+    const stats = itemStats(item);
+    return `    · [${sourceLabel(item.source)}] ${item.title}${stats ? ` (${stats})` : ''}`;
+  });
+  return `- ${entity.name} (${entity.type})${status}: ${entity.mentions} mentions across ${sources}${entity.gist ? `. Gist: ${entity.gist}` : ''}\n${refs.join('\n')}`;
 }
 
-/**
- * Creates a WAV header for PCM data
- */
-function createWavBuffer(pcmData, sampleRate = 24000, numChannels = 1) {
-  const header = Buffer.alloc(44);
-  const totalDataLen = pcmData.length;
-  const totalFileSize = totalDataLen + 36;
-  const bitDepth = 16;
+function briefingPrompt({ dateStr, sections, emerging, warmingUp }) {
+  const blocks = [];
+  const add = (title, lines) => { if (lines.length) blocks.push(`## ${title}\n${lines.join('\n')}`); };
+  add('WORLD NEWS', sections.world.map(describeItem));
+  add(warmingUp
+    ? 'HOT ACROSS SOURCES (AI names showing up in several independent sources today)'
+    : 'EMERGING IN AI (new or spiking names, confirmed by several independent sources)',
+  emerging.map(e => describeEntity(e, warmingUp)));
+  for (const [category, title] of CONTEXT_SECTIONS) add(title, sections[category].map(describeItem));
 
-  header.write('RIFF', 0);
-  header.writeUInt32LE(totalFileSize, 4);
-  header.write('WAVE', 8);
-  header.write('fmt ', 12);
-  header.writeUInt32LE(16, 16); // Subchunk1Size
-  header.writeUInt16LE(1, 20); // AudioFormat (1=PCM)
-  header.writeUInt16LE(numChannels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(sampleRate * numChannels * (bitDepth / 8), 28); // ByteRate
-  header.writeUInt16LE(numChannels * (bitDepth / 8), 32); // BlockAlign
-  header.writeUInt16LE(bitDepth, 34);
-  header.write('data', 36);
-  header.writeUInt32LE(totalDataLen, 40);
+  const emergingStep = emerging.length
+    ? `${warmingUp ? 'Hot across sources' : 'Emerging in AI'}: for each name, explain what it is and why people are paying attention. Use web search to find out what it is when the material is thin. This is the most important part of the briefing.`
+    : 'Nothing qualified as emerging today, so skip that part.';
 
-  return Buffer.concat([header, pcmData]);
+  return `You are the host of "Daily Pulse", a personal morning audio briefing for a student who follows world news and, above all, wants to keep up with what's new and trending in AI: models, methods and applications.
+It is ${dateStr}.
+
+Today's material, grouped by section (engagement numbers show how much attention each item is getting):
+
+${blocks.join('\n\n')}
+
+Write the spoken script for today's briefing:
+1. Open with exactly: "Good morning, today is ${dateStr}. Here is your Daily Pulse."
+2. World: the 3 or 4 most important stories, one or two sentences each.
+3. ${emergingStep}
+4. Trending in AI: the most notable models, repos and Hacker News discussions — what they do and why they matter. Group related items (for example a model and the repos built on it) instead of listing them one by one.
+5. Research: 2 or 3 papers, one sentence each on the main idea.
+6. Labs, tech and industry: the 2 to 4 most significant announcements.
+7. Close with one short sentence.
+
+Rules:
+- The text is read verbatim by a text-to-speech engine: plain spoken sentences only. No markdown, headings, lists, emojis, URLs or stage directions.
+- Say names the way a person would: "Qwen 3.8" rather than "unsloth/Qwen3.8-27B-GGUF"; drop repo owners unless the owner is the point.
+- Be factual. Only state what the material or your search results support, and never invent numbers.
+- Leave out weak items rather than padding. Skip any part that has no material.
+- Length: 550 to 650 words (about 4 minutes).`;
 }
+
+/** Belt and braces: TTS reads everything verbatim, so strip any markdown that slipped through. */
+const toSpeech = (text) => text
+  .replace(/^#+\s*/gm, '')
+  .replace(/\*\*?|__|`/g, '')
+  .replace(/^\s*[-•]\s+/gm, '')
+  .replace(/https?:\/\/\S+/g, '')
+  .replace(/\n{3,}/g, '\n\n')
+  .trim();
 
 // ------------------------------------------------------------------
 // MAIN LOGIC
 // ------------------------------------------------------------------
 
+function writeOutputs(files) {
+  fs.rmSync(OUT_DIR, { recursive: true, force: true }); // don't leave a stale file from a previous run
+  fs.mkdirSync(OUT_DIR, { recursive: true });
+  for (const [name, content] of Object.entries(files)) {
+    if (content != null) fs.writeFileSync(path.join(OUT_DIR, name), content);
+  }
+}
+
 async function main() {
-  console.log("🚀 Starting Daily Pulse (Headless Mode)...");
+  loadDotEnv();
+  const args = new Set(process.argv.slice(2));
+  const dryRun = args.has('--dry-run') || ['1', 'true'].includes(String(process.env.DRY_RUN).toLowerCase());
+  const withAudio = !args.has('--no-audio');
 
-  const apiKey = process.env.GEMINI_API_KEY;
-  const botToken = process.env.TELEGRAM_BOT_TOKEN;
-  const chatId = process.env.TELEGRAM_CHAT_ID;
-
-  if (!apiKey || !botToken || !chatId) {
-    console.error("❌ Missing required environment variables (GEMINI_API_KEY, TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)");
+  const { TELEGRAM_BOT_TOKEN: botToken, TELEGRAM_CHAT_ID: chatId, GITHUB_TOKEN: githubToken } = process.env;
+  const llm = createLLM();
+  const missing = [...llm.missing, ...Object.entries({ TELEGRAM_BOT_TOKEN: botToken, TELEGRAM_CHAT_ID: chatId })
+    .filter(([, value]) => !value)
+    .map(([name]) => name)];
+  if (missing.length && !dryRun) {
+    console.error(`❌ Missing required environment variables: ${missing.join(', ')}`);
     process.exit(1);
   }
 
-  const ai = new GoogleGenAI({ apiKey });
+  console.log(`🚀 Starting Daily Pulse${dryRun ? ' (dry run: nothing will be sent)' : ''}...`);
+  if (!llm.client) console.warn(`⚠️  No ${llm.missing.join(', ')}: skipping trend analysis, briefing and audio (digest only).`);
+  else console.log(`   Models (${llm.name}): ${llm.models}`);
 
-  // 1. Fetch RSS Feeds
-  console.log("📡 Fetching RSS Feeds...");
-  let allItems = [];
-  
-  for (const [name, url] of Object.entries(FEEDS)) {
+  const ai = llm.client ? llm : null;
+  const now = new Date();
+  const today = isoDate(now);
+  const dateStr = now.toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric', timeZone: 'UTC' });
+  const history = loadHistory();
+  let historyChanged = false;
+  const problems = []; // Non-fatal failures: we still deliver what we can, then exit non-zero so GitHub emails you
+
+  // 1. Fetch sources
+  console.log('📡 Fetching sources...');
+  const { items, health } = await fetchAllSources({ githubToken });
+  if (!items.length) throw new Error('Every source failed to fetch');
+
+  // 2. Rank & curate
+  console.log('🧠 Ranking & curating...');
+  const candidates = prepareCandidates(items);
+
+  // 3. Detect trends
+  let tags = new Map();
+  let groups = new Map();
+  let emerging = [];
+  let warmingUp = false;
+  if (ai) {
+    console.log('📈 Detecting trends...');
     try {
-      const resp = await fetch(url);
-      if (resp.ok) {
-        const text = await resp.text();
-        const items = parseRSS(name, text);
-        allItems.push(...items);
-        console.log(`   - Fetched ${items.length} items from ${name}`);
-      } else {
-        console.warn(`   ! Failed to fetch ${name}: ${resp.status}`);
-      }
-    } catch (e) {
-      console.warn(`   ! Error fetching ${name}: ${e.message}`);
+      const pool = trendPool(candidates);
+      tags = await extractEntities(ai, pool);
+      groups = aggregateEntities(pool, tags);
+      ({ emerging, warmingUp } = detectEmerging(history, groups, today));
+      recordDay(history, groups, today);
+      historyChanged = true;
+      console.log(`   Tagged ${tags.size}/${pool.length} items: ${groups.size} entities, ${emerging.length} emerging${warmingUp ? ' (history warming up)' : ''}`);
+      for (const e of emerging) console.log(`   🔥 ${e.name} (${e.type}): ${e.mentions} mentions across ${[...e.sources].map(sourceLabel).join(', ')}`);
+    } catch (error) {
+      problems.push(`Trend analysis failed: ${error.message}`);
+      console.error(`   ! ${problems.at(-1)}`);
     }
   }
 
-  // 2. Rank & Curate
-  console.log("🧠 Ranking & Curating...");
-  const ranked = allItems
-    .map(item => ({ ...item, score: calculateRank(item) }))
-    .sort((a, b) => b.score - a.score);
+  const isAI = (item) => tags.get(item.id)?.ai ?? AI_PATTERN.test(`${item.title} ${item.description}`);
+  const excludeLinks = new Set(emerging.flatMap(e => e.items.slice(0, 2).map(item => item.link)));
+  const sections = selectSections(candidates, { isAI, excludeLinks, shown: history.shown, today });
 
-  // Simple Deduplication by normalized title
-  const seen = new Set();
-  const curated = [];
-  // Slightly increased limit to accommodate more research papers
-  const MAX_STORIES = 20; 
-  
-  for (const item of ranked) {
-    const norm = item.title.toLowerCase().replace(/[^a-z0-9]/g, '');
-    if (!seen.has(norm) && curated.length < MAX_STORIES) {
-      seen.add(norm);
-      curated.push(item);
+  // 4. Write the briefing script
+  let prompt = null;
+  let script = null;
+  if (ai) {
+    console.log('✍️  Writing briefing...');
+    prompt = briefingPrompt({ dateStr, sections, emerging, warmingUp });
+    try {
+      script = toSpeech(await generateText(ai, prompt, { search: true, label: 'Briefing' }));
+      console.log(`   ${script.split(/\s+/).length} words`);
+    } catch (error) {
+      problems.push(`Briefing generation failed: ${error.message}`);
+      console.error(`   ! ${problems.at(-1)}`);
     }
   }
 
-  // Build Context with Abstracts for arXiv papers
-  const context = curated.map(i => {
-    let entry = `- [${i.source}] ${i.title}`;
-    if (i.source.includes('arxiv') && i.description) {
-      entry += `\n  Abstract: ${i.description}`;
+  // 5. Synthesize audio
+  let audio = null;
+  if (script && withAudio) {
+    console.log('🗣️  Synthesizing audio...');
+    try {
+      audio = await synthesizeSpeech(ai, script);
+      console.log(`   ${(audio.length / 1e6).toFixed(1)} MB`);
+    } catch (error) {
+      problems.push(`Text-to-speech failed: ${error.message}`);
+      console.error(`   ! ${problems.at(-1)}`);
     }
-    return entry;
-  }).join("\n");
-  
-  // 3. Generate Briefing Text
-  console.log("✍️ Generating Briefing Text...");
-  
-  const dateStr = new Date().toLocaleDateString('en-US', { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
-  
-  const prompt = `
-    You are a professional personal news anchor.
-    It is currently ${dateStr}.
+  }
 
-    Here are the top headlines for today from trusted sources:
-    ${context}
-
-    Write a concise, engaging morning briefing script.
-    You MUST cover these areas:
-    1. Major World News
-    2. Artificial Intelligence & Machine Learning Research
-    3. Technology Trends
-
-    Specific Instructions:
-    - **Start** with "Good Morning, today is ${dateStr}. Here is your daily briefing..."
-    - For any research papers (like arXiv) mentioned, you **must** provide a one-sentence summary of the main contribution/idea based on the abstract provided.
-    - Do not read out URLs.
-    - Keep it under 3 minutes of speaking time (approx 400-500 words).
-  `;
-
-  // Wrap API call in retry logic
-  const textResp = await retryWithBackoff(() => ai.models.generateContent({
-    model: "gemini-2.5-flash",
-    contents: prompt,
-    // Note: We use the RSS feeds as primary context, but we enable Search 
-    // to fill in details if the headlines are vague.
-    config: { tools: [{ googleSearch: {} }] } 
-  }));
-  
-  const briefingText = textResp.text;
-  console.log("   Briefing Length:", briefingText.length);
-
-  // 4. Generate Audio (TTS)
-  console.log("🗣️  Synthesizing Audio...");
-  
-  // Wrap API call in retry logic
-  const audioResp = await retryWithBackoff(() => ai.models.generateContent({
-    model: "gemini-2.5-flash-preview-tts",
-    contents: [{ parts: [{ text: briefingText }] }],
-    config: {
-      responseModalities: ["AUDIO"],
-      speechConfig: {
-        voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } },
-      },
-    },
-  }));
-
-  const base64Audio = audioResp.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-  if (!base64Audio) throw new Error("No audio generated");
-
-  // Convert Base64 -> Buffer -> WAV
-  const pcmBuffer = Buffer.from(base64Audio, 'base64');
-  const wavBuffer = createWavBuffer(pcmBuffer);
-
-  // 5. Send to Telegram
-  console.log("✈️  Sending to Telegram...");
-  
-  const formData = new FormData();
-  formData.append('chat_id', chatId);
-  formData.append('caption', `Daily Briefing (${dateStr})`);
-  formData.append('title', `Daily Briefing - ${dateStr}`);
-  formData.append('performer', 'Gemini AI');
-  
-  // Blob is available in Node 18+
-  const blob = new Blob([wavBuffer], { type: 'audio/wav' });
-  formData.append('audio', blob, `briefing-${new Date().toISOString().split('T')[0]}.wav`);
-
-  const tgResp = await fetch(`https://api.telegram.org/bot${botToken}/sendAudio`, {
-    method: 'POST',
-    body: formData
+  // 6. Build the link digest
+  const digest = buildDigest({ dateStr, emerging, warmingUp, sections, health, notes: problems });
+  writeOutputs({
+    'context.md': prompt,
+    'briefing.txt': script,
+    'briefing.wav': audio,
+    'digest.html': digest,
+    'trends.json': JSON.stringify({
+      warmingUp,
+      emerging: emerging.map(({ items: refs, sources, names, types, gists, ...e }) => ({ ...e, sources: [...sources], items: refs.map(i => i.link) })),
+      entities: [...groups.values()].sort((a, b) => b.mentions - a.mentions)
+        .map(g => ({ name: g.name, type: g.type, mentions: g.mentions, sources: [...g.sources], gist: g.gist })),
+    }, null, 2),
   });
+  console.log(`   Outputs written to ${path.relative(process.cwd(), OUT_DIR) || OUT_DIR}/`);
 
-  if (!tgResp.ok) {
-    const err = await tgResp.text();
-    throw new Error(`Telegram API Error: ${err}`);
+  // 7. Send to Telegram
+  if (!dryRun) {
+    console.log('✈️  Sending to Telegram...');
+    try {
+      if (audio) {
+        await sendAudio(botToken, chatId, audio, {
+          title: `Daily Pulse - ${dateStr}`,
+          caption: `Daily Pulse (${dateStr})`,
+          filename: `daily-pulse-${today}.wav`,
+        });
+      } else if (script) {
+        await sendMessage(botToken, chatId, `<b>🎙️ Today's briefing (audio unavailable)</b>\n\n${escapeHtml(script)}`);
+      }
+    } catch (error) {
+      problems.push(`Sending audio failed: ${error.message}`);
+      console.error(`   ! ${problems.at(-1)}`);
+    }
+    await sendMessage(botToken, chatId, digest);
+
+    const sentLinks = [...excludeLinks, ...Object.values(sections).flat().map(item => item.link)];
+    recordShown(history, sentLinks, today);
+    historyChanged = true;
   }
 
-  console.log("✅ Briefing Sent Successfully!");
+  if (historyChanged) saveHistory(history);
+
+  if (problems.length) {
+    console.error(`❌ Finished with ${problems.length} problem(s):\n${problems.map(p => `   - ${p}`).join('\n')}`);
+    process.exit(1);
+  }
+  console.log(dryRun ? '✅ Dry run complete.' : '✅ Briefing sent successfully!');
 }
 
 main().catch(err => {
-  console.error("❌ Fatal Error:", err);
+  console.error('❌ Fatal Error:', err);
   process.exit(1);
 });

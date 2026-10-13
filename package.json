@@ -4,12 +4,14 @@
   "type": "module",
   "description": "Headless Daily Pulse Assistant for GitHub Actions",
   "scripts": {
-    "briefing": "node scripts/daily-briefing.mjs"
+    "briefing": "node scripts/daily-briefing.mjs",
+    "briefing:dry": "node scripts/daily-briefing.mjs --dry-run"
   },
   "dependencies": {
-    "@google/genai": "^1.0.0"
+    "@google/genai": "^2.27.0",
+    "fast-xml-parser": "^5.11.2"
   },
   "engines": {
-    "node": ">=18.0.0"
+    "node": ">=20.12.0"
   }
 }

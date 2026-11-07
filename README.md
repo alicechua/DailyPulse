@@ -10,6 +10,7 @@ Daily Pulse is a personalized news assistant that keeps you updated on the world
 *   **Smart Curation**: Aggregates and ranks world news, AI labs, newsletters, Hacker News, rising GitHub repos, Hugging Face trending models and community-upvoted papers.
 *   **🔥 Trend Detection**: Tags every AI item with the models, methods and products it mentions, remembers what it has seen, and flags names that are **new or spiking** *and* confirmed by **2+ independent sources** (e.g. a launch on Hacker News + repos built on it on GitHub).
 *   **AI Synthesis**: Uses **Gemini 3.8 Flash** with **Search Grounding** to write a professional, factual morning briefing script.
+*   **⚖️ Big News Only**: Rates every story from 1 to 10 and only reports the ones that clear their section's bar (`MIN_IMPORTANCE` in `scripts/lib/rank.mjs`, 7 by default), so a quiet section stays silent. A quiet day still covers its top 3 stories, and stories that repeat each other are reported once. The top 5 get a few sentences each and the next 6 are name-dropped, so the audio stays **under 2:30** (if it runs long, the script is cut and re-recorded). The digest lists only the reported stories and opens with what the audio covered.
 *   **High-Quality TTS**: Converts text to speech using **Gemini 3.8 Flash TTS** (Voice: Kore).
 *   **Telegram Integration**: Sends the audio briefing plus a text digest with links to everything mentioned.
 *   **No repeats**: Items already sent on a previous day are skipped.
@@ -82,7 +83,7 @@ If you want to run the interactive dashboard locally:
 ```bash
 npm install
 echo 'GEMINI_API_KEY=your_key' > .env   # gitignored; add TELEGRAM_* too to send for real (or the AZURE_* vars + LLM_PROVIDER=azure)
-npm run briefing:dry                    # writes out/briefing.txt, digest.html, briefing.wav, trends.json
+npm run briefing:dry                    # writes out/briefing.txt, digest.html, briefing.wav, trends.json, ranking.json
 node scripts/daily-briefing.mjs --dry-run --no-audio   # skip text-to-speech while iterating
 npm run briefing                        # full run: sends to Telegram
 ```
@@ -118,10 +119,11 @@ npm run dev
 *   **`src/App.tsx`**: Main React UI logic.
 *   **`src/services/geminiService.ts`**: Handles prompt engineering, Search Grounding, and Text-to-Speech generation.
 *   **`src/services/rssService.ts`**: Contains the logic ported from Python for fetching RSS feeds, calculating "freshness" scores, and deduplicating news items.
-*   **`scripts/daily-briefing.mjs`**: The headless pipeline used by the GitHub Action: fetch → curate → detect trends → write script → TTS → Telegram.
+*   **`scripts/daily-briefing.mjs`**: The headless pipeline used by the GitHub Action: fetch → curate → detect trends → rank by importance → write script → TTS → Telegram.
 *   **`scripts/lib/sources.mjs`**: All sources (RSS feeds, Hacker News, GitHub, Hugging Face). Add or remove feeds here.
 *   **`scripts/lib/curate.mjs`**: Ranking, per-section quotas, AI filtering and repeat suppression.
 *   **`scripts/lib/trends.mjs`**: Entity extraction, trend history and emerging-trend detection.
+*   **`scripts/lib/rank.mjs`**: Importance ranking and the per-section "big news" bars: what the audio covers, what it name-drops, and what is left out.
 *   **`scripts/lib/gemini.mjs`** / **`telegram.mjs`**: Gemini text/TTS calls; Telegram digest formatting and sending.
 *   **`data/trend-history.json`**: What the trend detector has seen (updated daily by the workflow).
 *   **`.github/workflows/daily-briefing.yml`**: Cron job configuration for the automation.

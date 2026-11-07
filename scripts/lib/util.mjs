@@ -77,6 +77,20 @@ export const truncate = (text, max) => (text.length > max ? `${text.slice(0, max
 export const escapeHtml = (text) => String(text)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
+/** Length in seconds of a PCM WAV buffer (NaN if it can't be parsed). */
+export function wavDuration(wav) {
+  let byteRate = 0;
+  for (let offset = 12; offset + 8 <= wav.length;) {
+    const id = wav.toString('ascii', offset, offset + 4);
+    const size = wav.readUInt32LE(offset + 4);
+    if (id === 'fmt ') byteRate = wav.readUInt32LE(offset + 16);
+    // Streamed WAVs may leave the data size at 0 or 0xFFFFFFFF: fall back to the bytes actually there
+    if (id === 'data') return byteRate ? Math.min(size || Infinity, wav.length - offset - 8) / byteRate : NaN;
+    offset += 8 + size + (size % 2);
+  }
+  return NaN;
+}
+
 /** Compact number: 1234 -> 1.2k */
 export function compact(n) {
   if (n == null) return '';
